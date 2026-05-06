@@ -425,11 +425,28 @@ pub fn ssmSnapshot(src: *const SSMCacheEntry) SSMCacheEntrySnapshot {
         .ssm_state = mlx.mlx_array_new(),
         .initialized = src.initialized,
     };
-    if (src.initialized) {
-        // mlx_array_set increments refcount on the underlying buffer; both
-        // handles point at the same data. Subsequent writes to src.conv_state
-        // create a NEW handle so the snapshot's view is unaffected.
+    // mlx_array_set increments refcount on the underlying buffer; both handles
+    // point at the same data. Subsequent writes to src.conv_state/ssm_state
+    // create NEW handles so the snapshot's view is unaffected.
+    //
+    // We must guard each field independently — the two states are populated by
+    // DIFFERENT code paths and either may legitimately be null even when
+    // `initialized == true`:
+    //   - LFM2 `gatedConv` writes only `conv_state` (sets `initialized=true`),
+    //     so `ssm_state.ctx == null` for the lifetime of that layer.
+    //   - Mamba2/GatedDeltaNet flip the order: `conv1dWithCache` sets
+    //     `initialized=true` BEFORE the recurrence body initializes
+    //     `ssm_state`, so a snapshot taken in the middle would see a null
+    //     ssm_state. (Currently snapshots are only taken between full forward
+    //     passes, but defensive null-handling prevents future regressions.)
+    //
+    // Calling `mlx_array_set` with a null source aborts the process via mlx-c's
+    // default error handler ("expected a non-empty mlx_array"), so we cannot
+    // rely on `try mlx.check(...)`.
+    if (src.conv_state.ctx != null) {
         _ = mlx.mlx_array_set(&out.conv_state, src.conv_state);
+    }
+    if (src.ssm_state.ctx != null) {
         _ = mlx.mlx_array_set(&out.ssm_state, src.ssm_state);
     }
     return out;
@@ -446,8 +463,12 @@ pub fn ssmRestore(dst: *SSMCacheEntry, snap: *const SSMCacheEntrySnapshot) !void
     dst.conv_state = mlx.mlx_array_new();
     dst.ssm_state = mlx.mlx_array_new();
     dst.initialized = snap.initialized;
-    if (snap.initialized) {
+    // Mirror snapshot's per-field null guard — the snapshot may legitimately
+    // have a null ssm_state (LFM2 gated_conv layers) or null conv_state.
+    if (snap.conv_state.ctx != null) {
         try mlx.check(mlx.mlx_array_set(&dst.conv_state, snap.conv_state));
+    }
+    if (snap.ssm_state.ctx != null) {
         try mlx.check(mlx.mlx_array_set(&dst.ssm_state, snap.ssm_state));
     }
 }
@@ -1462,12 +1483,14 @@ pub const Transformer = struct {
                     _ = mlx.mlx_array_free(dst.ssm_state);
                     dst.conv_state = mlx.mlx_array_new();
                     dst.ssm_state = mlx.mlx_array_new();
-                    if (src.initialized) {
+                    dst.initialized = src.initialized;
+                    // Per-field null guard — LFM2 gated_conv layers fill only
+                    // conv_state, never ssm_state, even after initialization.
+                    if (src.conv_state.ctx != null) {
                         try mlx.check(mlx.mlx_array_set(&dst.conv_state, src.conv_state));
+                    }
+                    if (src.ssm_state.ctx != null) {
                         try mlx.check(mlx.mlx_array_set(&dst.ssm_state, src.ssm_state));
-                        dst.initialized = true;
-                    } else {
-                        dst.initialized = false;
                     }
                 }
             }
@@ -1514,11 +1537,15 @@ pub const Transformer = struct {
             for (entries, ssm_copy) |src, *dst| {
                 dst.conv_state = mlx.mlx_array_new();
                 dst.ssm_state = mlx.mlx_array_new();
-                if (src.initialized) {
+                dst.initialized = src.initialized;
+                // Per-field null guard — LFM2 gated_conv layers fill only
+                // conv_state, never ssm_state, even when `initialized==true`.
+                if (src.conv_state.ctx != null) {
                     _ = mlx.mlx_array_set(&dst.conv_state, src.conv_state);
+                }
+                if (src.ssm_state.ctx != null) {
                     _ = mlx.mlx_array_set(&dst.ssm_state, src.ssm_state);
                 }
-                dst.initialized = src.initialized;
             }
             ssm = ssm_copy;
         }
@@ -2838,6 +2865,26 @@ pub const Transformer = struct {
 
         const final_normed = try self.rmsNorm(h, self.final_norm);
         _ = mlx.mlx_array_free(h);
+
+        // Speculative-decoding capture: slice the LAST position of the
+        // post-final-norm hidden into `mtp_capture_hidden` (refcount-shared).
+        // Used by both MTP (Qwen3.5 path also captures here when promoted to
+        // forwardStandard, though typically routes through forwardMoe) and
+        // the Gemma 4 assistant drafter (which needs the post-final-norm
+        // hidden as h_prev seed). Mirrors the identical block in forwardMoe
+        // (search "MTP capture" there for the verified pattern).
+        if (self.mtp_capture_hidden) |target| {
+            const fn_shape = mlx.getShape(final_normed);
+            const last = fn_shape[1] - 1;
+            const start = [_]c_int{ 0, last, 0 };
+            const stop = [_]c_int{ fn_shape[0], fn_shape[1], fn_shape[2] };
+            const strides = [_]c_int{ 1, 1, 1 };
+            var sliced = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice(&sliced, final_normed, &start, 3, &stop, 3, &strides, 3, self.s));
+            _ = mlx.mlx_array_set(target, sliced);
+            _ = mlx.mlx_array_free(sliced);
+        }
+
         if (self.embedding_mode) return final_normed;
         var logits = try self.qmatmul(final_normed, self.lm_head_w, self.lm_head_s, self.lm_head_b);
         _ = mlx.mlx_array_free(final_normed);
@@ -6021,6 +6068,55 @@ test "SSMCacheEntry snapshot/restore round-trip preserves arrays" {
     try testing.expectEqual(@as(c_int, 2), restored_shape[1]);
     try testing.expectEqual(@as(c_int, 8), restored_shape[2]);
     try testing.expectEqual(@as(c_int, 4), restored_shape[3]);
+}
+
+test "SSMCacheEntry snapshot/restore handles null ssm_state (LFM2 gated_conv)" {
+    // LFM2 `gatedConv` populates `conv_state` but never `ssm_state` — the
+    // gated-convolution layer doesn't have a recurrence state, only a
+    // convolution-window cache. The snapshot/restore code must NOT crash on
+    // this shape (`initialized=true`, `conv_state` non-null, `ssm_state.ctx`
+    // null). This was the root cause of the Workstream D PLD-on-hybrid bug.
+    const s = mlx.gpuStream();
+    var entry: SSMCacheEntry = .{
+        .conv_state = mlx.mlx_array_new(),
+        .ssm_state = mlx.mlx_array_new(), // stays null — no LFM2 layer ever touches it
+        .initialized = false,
+    };
+    defer {
+        _ = mlx.mlx_array_free(entry.conv_state);
+        _ = mlx.mlx_array_free(entry.ssm_state);
+    }
+
+    // Simulate `conv1dWithCache` having run once: conv_state populated,
+    // initialized=true, ssm_state still null (its ctx is null).
+    const conv_shape = [_]c_int{ 1, 3, 4 };
+    _ = mlx.mlx_array_free(entry.conv_state);
+    entry.conv_state = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_zeros(&entry.conv_state, &conv_shape, 3, .float32, s));
+    entry.initialized = true;
+    try testing.expect(entry.ssm_state.ctx == null);
+
+    // Snapshot must succeed without dereferencing the null ssm_state.
+    var snap = ssmSnapshot(&entry);
+    defer ssmSnapshotDeinit(&snap);
+    try testing.expect(snap.initialized);
+    try testing.expect(snap.conv_state.ctx != null);
+    try testing.expect(snap.ssm_state.ctx == null);
+
+    // Mutate conv_state in `entry`, then restore — restore must rebind
+    // conv_state without crashing on the still-null ssm_state.
+    _ = mlx.mlx_array_free(entry.conv_state);
+    entry.conv_state = mlx.mlx_array_new();
+    const mutated_shape = [_]c_int{ 1, 1, 1 };
+    try mlx.check(mlx.mlx_zeros(&entry.conv_state, &mutated_shape, 3, .float32, s));
+
+    try ssmRestore(&entry, &snap);
+    try testing.expect(entry.initialized);
+    try testing.expect(entry.ssm_state.ctx == null); // still null after restore
+    const restored = mlx.getShape(entry.conv_state);
+    try testing.expectEqual(@as(c_int, 1), restored[0]);
+    try testing.expectEqual(@as(c_int, 3), restored[1]);
+    try testing.expectEqual(@as(c_int, 4), restored[2]);
 }
 
 // ── MTP weight binder tests ─────────────────────────────────────────────────
