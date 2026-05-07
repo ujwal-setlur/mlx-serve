@@ -31,6 +31,7 @@ brew install mlx-serve          # CLI server only
 - Tool calling (function calling) with automatic detection
 - KV cache reuse across requests for fast multi-turn conversations
 - Sampling: temperature, top-k, top-p, repeat penalty, presence penalty
+- **Speculative decoding** — PLD (model-agnostic n-gram lookup, on by default), MTP (Qwen3.5+ self-speculative head), and the Gemma 4 assistant drafter. Adaptive prompt-time gate keeps novel content at parity; agentic code-edit loops see up to 1.6×.
 - Vision/image support (Gemma 4 SigLIP encoder) — send images via `image_url` content blocks
 - Reasoning/thinking mode support
 - Chat templates via Jinja2 (Jinja_cpp) with fallback formatting
@@ -46,7 +47,7 @@ Menu bar app that wraps the server with a full UI:
 - **Editable system prompt** -- customize agent behavior via `~/.mlx-serve/system-prompt.md` (Agent menu → Edit System Prompt)
 - **Persistent memory** -- agent can save memories across sessions to `~/.mlx-serve/memory.md`
 - **Prompt-based skills** -- drop `.md` files in `~/.mlx-serve/skills/` to teach the agent custom capabilities
-- **Server management** -- start/stop server, view logs, configure max tokens
+- **Server management** -- start/stop server, view logs, full **Settings window** (Cmd+,) for every server-launch flag and per-request default
 - **Image Generation (FLUX.2)** -- optional, tray button; requires Python (see below)
 - **Video Generation (LTX-Video 2.3, MLX-native, with audio)** -- optional, tray button; requires Python + ffmpeg (see below)
 
@@ -159,8 +160,14 @@ Requires `APPLE_DEVELOPER_ID` and `APPLE_TEAM_ID` environment variables for code
 | `--temp F` | `0.0` | Sampling temperature (0 = greedy) |
 | `--ctx-size N` | auto | Context window size (auto = computed from GPU memory) |
 | `--timeout N` | `300` | Request timeout in seconds |
-| `--reasoning-budget N` | `0` | Thinking token budget (0 = disabled) |
+| `--reasoning-budget N` | `-1` | Thinking token budget (`-1` = unlimited, `0` = no thinking) |
 | `--no-vision` | off | Disable vision encoder even if model supports it |
+| `--pld` / `--no-pld` | on | Prompt Lookup Decoding (model-agnostic spec-decode) |
+| `--pld-draft-len N` | `5` | Max draft tokens per PLD step |
+| `--pld-key-len N` | `3` | N-gram match key length for PLD |
+| `--mtp` | off | Self-speculative MTP head (Qwen3.5+ checkpoints with MTP weights) |
+| `--drafter DIR` | none | Gemma 4 assistant drafter checkpoint (e.g. `gemma-4-E4B-it-assistant-bf16`) |
+| `--draft-block-size N` | `4` | Drafts per round for the Gemma 4 drafter |
 | `--log-level` | `info` | Log level (error, warn, info, debug) |
 
 ## API
@@ -246,6 +253,30 @@ Matches mlx-lm (Python) generation speed while using less memory and starting 3x
 
 Run 3 times and take the average of runs 2-3 (run 1 includes model loading from disk).
 </details>
+
+## Speculative Decoding
+
+Three flavors, all greedy-equivalent (byte-identical at temp=0 within the first 30 tokens; mathematically exact at temp > 0 via the Leviathan probability-ratio sampler):
+
+- **PLD** (Prompt Lookup Decoding) — model-agnostic n-gram match in `prompt + generated_tokens`. Default-on (`--pld`); zero per-model setup. Wins on agentic loops, RAG, code editing, anywhere the answer echoes prompt content.
+- **MTP** (Multi-Token Prediction) — uses the native MTP head shipped with Qwen3.5/3.6/Qwen3-Next when present. Opt-in via `--mtp`. Most MLX-converted Qwen checkpoints strip the MTP weights at conversion; `/v1/models` reports `supports_mtp` so the UI can grey out the toggle.
+- **Gemma 4 assistant drafter** — Google's small 4-layer cross-attention drafters (`gemma-4-{E2B,E4B,26B-A4B,31B}-it-assistant-bf16`). Opt-in via `--drafter <dir>`. The drafter cross-attends into the target's KV cache — no separate weights duplicated.
+
+All three share an **adaptive prompt-time gate**: a 3-gram repetition score on the prompt (`spec_gate_threshold = 0.01`) auto-disables speculation on novel content, so creative writing and one-shot Q&A run at parity with `--no-pld` instead of paying per-step verify overhead. A **runtime acceptance gate** further disables speculation mid-decode if accept rate falls below break-even (0.30 for PLD/drafter after 5 attempts; 0.70 for MTP after 8). Sticky for the rest of the request.
+
+### Speedup on the realistic agentic code-edit workload
+
+Apple M-series, MLX 4-bit weights, temp=0, function in prompt + small modification requested (the canonical mlx-serve workload). `nospec` = same v26.5.4 binary with `--no-pld`:
+
+| Model | nospec | PLD | MTP | Drafter |
+|---|---:|---:|---:|---:|
+| Gemma 4 E4B (4-bit) | 28.0 tok/s | **45.0 tok/s · 1.61×** | — | **44.6 tok/s · 1.59×** |
+| Qwen 3.5 4B MTPLX (4-bit) | 28.1 tok/s | **40.5 tok/s · 1.44×** | 26.2 tok/s · 0.93× | — |
+| LFM2.5 350M (8-bit) | 162 tok/s | 160 tok/s · 0.99× | — | — |
+
+On creative / novel-content prompts all three features stay at parity (≈1.0×) thanks to the gate — **no regression**. MTP did not pay off in this run because the prompts weren't memorized-text heavy (MTP's strongest case); the runtime gate correctly fell back. The 350M LFM2.5 is roughly neutral on spec-decode — its forward is small enough that the verify pass costs about the same as AR.
+
+Reproduce with **`./tests/bench_spec_matrix.sh`** (release-comparison matrix vs. the shipped binary) or **`./tests/bench_spec.sh --corpus`** (9-prompt threshold-tuning corpus across echo, code-rename, JSON, RAG, agent, plain Q&A, code-translate, summarize, creative).
 
 ## License
 
