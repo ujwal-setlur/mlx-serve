@@ -1,6 +1,6 @@
 # Changelog
 
-## v26.6.1 — Current Future Release **UNRELEASED**
+## v26.6.1 — Gemma 4 12b Support
 - **Gemma 4 12B.** Run `gemma-4-12b-it-4bit` — the dense 12B slots between E4B and the 26B-A4B MoE for a quality-vs-speed middle ground.
 - **Agent mode that actually codes.** The built-in agent now completes real multi-step coding tasks instead of stalling. Tool calls whose name carries a stray trailing colon (some Gemma 4 builds emit `shell:`) resolve correctly instead of dead-looping on "unknown tool"; the shell tool closes stdin so interactive scaffolders like `npm create svelte` / `npx sv create` fail fast instead of freezing the agent, backed by a timeout that can't hang on a runaway command; and the agent is steered toward non-interactive setup (`npm install` + writing files directly) over interactive wizards. A local model can now `npm install`, initialize Prisma, and create a SQLite database end-to-end.
 - **Reliable Gemma 4 tool calls with nested arguments.** Tool calls whose arguments contain nested objects or arrays — a metadata object, a list of recipients — now come back as valid JSON instead of malformed output that broke the call.
