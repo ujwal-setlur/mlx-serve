@@ -155,8 +155,10 @@ pub fn build(b: *std.Build) void {
     test_mod.linkFramework("Foundation", .{});
     test_mod.linkFramework("Metal", .{});
 
+    const test_filter = b.option([]const u8, "test-filter", "Only run tests whose name contains this substring");
     const unit_tests = b.addTest(.{
         .root_module = test_mod,
+        .filters = if (test_filter) |f| &.{f} else &.{},
     });
 
     const run_unit_tests = b.addRunArtifact(unit_tests);

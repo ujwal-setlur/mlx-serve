@@ -53,16 +53,8 @@ private struct TestHFModel: Identifiable, Codable {
     var modelName: String {
         id.split(separator: "/").last.map(String.init) ?? id
     }
-    var quantization: String? {
-        let lower = id.lowercased()
-        if lower.contains("4bit") || lower.contains("4-bit") || lower.contains("q4_") { return "4-bit" }
-        if lower.contains("3bit") || lower.contains("3-bit") { return "3-bit" }
-        if lower.contains("6bit") || lower.contains("6-bit") { return "6-bit" }
-        if lower.contains("8bit") || lower.contains("8-bit") || lower.contains("q8_") { return "8-bit" }
-        if lower.contains("fp16") { return "FP16" }
-        if lower.contains("bf16") { return "BF16" }
-        return nil
-    }
+    // Delegates to the real parser so this replica can't drift from it.
+    var quantization: String? { HFModel.quantizationLabel(forId: id) }
     var estimatedSizeBytes: Int64 {
         guard let params = safetensors?.parameters else { return 0 }
         var total: Int64 = 0
@@ -518,6 +510,132 @@ final class HFFallbackFetchGateTests: XCTestCase {
                         lastModified: nil, tags: ["diffusers"], safetensors: nil,
                         pipelineTag: "text-to-image")
         XCTAssertFalse(HFSearchService.needsFallbackFetch(m))
+    }
+}
+
+// MARK: - HFModel non-affine quantization gate
+//
+// MXFP (OCP microscaling) and NVFP (NVIDIA FP4) are non-affine weight layouts
+// the MLX safetensors loader can't decode — the Zig server's discovery gate
+// already skips them (model_discovery.peekConfig: quantization.mode != "affine").
+// Without a client-side gate the browser offered a "Download" that silently
+// never loads. These pin the reason surfaced in the row. GGUF repos are exempt:
+// llama.cpp loads mxfp4 (GPT-OSS) natively, and the server's quant gate is
+// MLX-only.
+
+final class HFModelQuantGateTests: XCTestCase {
+    private func mlx(id: String, tags: [String]? = nil, pipeline: String? = "text-generation") -> HFModel {
+        HFModel(id: id, downloads: 100, likes: 1, lastModified: nil,
+                tags: tags, safetensors: nil, pipelineTag: pipeline)
+    }
+
+    func testNvfp4_flaggedUnsupportedQuant() {
+        let m = mlx(id: "mlx-community/Qwen3-30B-A3B-nvfp4", tags: ["mlx", "qwen3"])
+        XCTAssertEqual(m.unsupportedQuantization, "NVFP4")
+        XCTAssertEqual(m.incompatibleReason, "Unsupported quantization (NVFP4)")
+    }
+
+    func testMxfpVariants_flagged() {
+        XCTAssertEqual(mlx(id: "x/model-mxfp4").unsupportedQuantization, "MXFP4")
+        XCTAssertEqual(mlx(id: "x/model-MXFP8-it").unsupportedQuantization, "MXFP8")
+    }
+
+    func testAffineQuant_notFlagged() {
+        XCTAssertNil(mlx(id: "mlx-community/gemma-4-e2b-it-4bit").unsupportedQuantization)
+        XCTAssertNil(mlx(id: "x/model-8bit").unsupportedQuantization)
+        XCTAssertNil(mlx(id: "x/model-bf16").incompatibleReason)
+    }
+
+    func testGgufMxfp_notFlagged() {
+        // GPT-OSS-style GGUF mxfp4 is served by the embedded llama.cpp engine —
+        // must NOT be flagged, or we'd hide a loadable download.
+        let g = HFModel(id: "lmstudio-community/gpt-oss-20b-MXFP4-GGUF", downloads: 1, likes: 1,
+                        lastModified: nil, tags: ["gguf"], safetensors: nil, pipelineTag: "text-generation")
+        XCTAssertNil(g.unsupportedQuantization)
+        XCTAssertNil(g.incompatibleReason)
+    }
+
+    func testArchitectureReasonTakesPrecedence() {
+        // An unsupported architecture is the more fundamental blocker — it wins
+        // the surfaced reason even when the name also carries an nvfp4 marker.
+        let m = HFModel(id: "x/some-diffusion-nvfp4", downloads: 1, likes: 1, lastModified: nil,
+                        tags: ["diffusers"], safetensors: nil, pipelineTag: nil)
+        XCTAssertEqual(m.incompatibleReason, "Unsupported architecture")
+    }
+}
+
+// MARK: - HFModel.quantization label parsing
+//
+// The badge column hardcoded only {3,4,6,8}-bit, so 2/5/9-bit MLX repos and
+// GGUF qN_/iqN_ ids showed no quant badge at all. These pin the generalized
+// width parsing against the real HFModel.
+
+final class HFModelQuantizationLabelTests: XCTestCase {
+    private func m(_ id: String) -> HFModel {
+        HFModel(id: id, downloads: nil, likes: nil, lastModified: nil,
+                tags: nil, safetensors: nil, pipelineTag: nil)
+    }
+
+    func testCommonMlxWidths() {
+        XCTAssertEqual(m("x/model-3bit").quantization, "3-bit")
+        XCTAssertEqual(m("x/model-4bit").quantization, "4-bit")
+        XCTAssertEqual(m("x/model-6bit").quantization, "6-bit")
+        XCTAssertEqual(m("x/model-8bit").quantization, "8-bit")
+    }
+
+    func testUncommonWidths_previouslyDropped() {
+        // The bug: any width outside {3,4,6,8} showed no badge.
+        XCTAssertEqual(m("x/model-2bit").quantization, "2-bit")
+        XCTAssertEqual(m("x/model-5bit").quantization, "5-bit")
+        XCTAssertEqual(m("x/model-9bit").quantization, "9-bit")
+        XCTAssertEqual(m("mlx-community/Foo-2-bit").quantization, "2-bit")
+    }
+
+    func testFpDtypes() {
+        XCTAssertEqual(m("x/model-bf16").quantization, "BF16")
+        XCTAssertEqual(m("x/model-fp16").quantization, "FP16")
+    }
+
+    func testGgufStyleQuants() {
+        XCTAssertEqual(m("x/model-Q2_K").quantization, "2-bit")
+        XCTAssertEqual(m("x/model-Q5_K_M").quantization, "5-bit")
+        XCTAssertEqual(m("x/model-Q6_K").quantization, "6-bit")
+        XCTAssertEqual(m("x/model-IQ3_M").quantization, "3-bit")
+    }
+
+    func testFractionalWidth_notTruncated() {
+        // "3.5bit" must not be misread as "5-bit".
+        XCTAssertEqual(m("x/model-3.5bit").quantization, "3.5-bit")
+    }
+
+    func testNoQuant_returnsNil() {
+        XCTAssertNil(m("x/plain-model").quantization)
+        XCTAssertNil(m("mlx-community/Qwen3-30B-A3B").quantization)
+    }
+
+    func testNonAffineFp_noBitBadge() {
+        // nvfp4 / mxfp4 surface via incompatibleReason, not as a misleading
+        // bit badge — the parser must leave them unlabeled.
+        XCTAssertNil(m("x/Qwen3-30B-nvfp4").quantization)
+        XCTAssertNil(m("x/model-mxfp4").quantization)
+    }
+
+    func testGgufRepo_showsMulti() {
+        // GGUF repos host many quant files; the repo ID has no single quant.
+        // The column should show "Multi" rather than "—".
+        let gguf = HFModel(id: "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+                           downloads: nil, likes: nil, lastModified: nil,
+                           tags: ["gguf"], safetensors: nil, pipelineTag: nil)
+        XCTAssertEqual(gguf.quantization, "Multi")
+    }
+
+    func testGgufRepo_specificQuant_preservedOverMulti() {
+        // A rare single-quant GGUF repo whose ID encodes the quant (e.g. Q4_K_M)
+        // should still show the specific label, not "Multi".
+        let gguf = HFModel(id: "user/model-Q4_K_M-GGUF",
+                           downloads: nil, likes: nil, lastModified: nil,
+                           tags: ["gguf"], safetensors: nil, pipelineTag: nil)
+        XCTAssertEqual(gguf.quantization, "4-bit")
     }
 }
 

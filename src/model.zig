@@ -34,8 +34,9 @@ pub const ModelConfig = struct {
     sliding_window: u32 = 1024,
     sliding_window_pattern: u32 = 6,
 
-    // Quantization
-    quant_bits: u32 = 4,
+    // Quantization. 0 = dense bf16 (config.json has no "quantization" key);
+    // quantized checkpoints always set this from that key (see parseConfig).
+    quant_bits: u32 = 0,
     quant_group_size: u32 = 64,
 
     // Attention scale: 1/sqrt(query_pre_attn_scalar) for Gemma, 1/sqrt(head_dim) for others
@@ -953,7 +954,7 @@ test "ModelConfig defaults" {
     const config = ModelConfig{};
     try testing.expectEqual(@as(u32, 0), config.num_eos_tokens);
     try testing.expectEqual(@as(u32, 0), config.max_position_embeddings);
-    try testing.expectEqual(@as(u32, 4), config.quant_bits);
+    try testing.expectEqual(@as(u32, 0), config.quant_bits); // 0 = dense bf16 (no "quantization" key)
     try testing.expectEqual(@as(u32, 64), config.quant_group_size);
     try testing.expect(!config.tie_word_embeddings);
 }
@@ -1320,4 +1321,50 @@ test "ModelConfig parses gemma4_unified vision + audio multimodal fields" {
     try testing.expectEqual(@as(u32, 258882), config.eoi_token_id);
     try testing.expectEqual(@as(u32, 256000), config.boa_token_id);
     try testing.expectEqual(@as(u32, 258883), config.eoa_token_id);
+}
+
+test "parseConfigFromJson dense bf16 qwen3_5_moe → quant_bits 0" {
+    // A fully-dense bf16 checkpoint (e.g. Qwen3.6-35B-A3B-bf16) has NO
+    // "quantization" key. quant_bits must stay 0 so the loader skips every
+    // .scales/.biases fetch and the forward pass dispatches to plain matmul.
+    const json =
+        \\{
+        \\  "model_type": "qwen3_5_moe",
+        \\  "text_config": {
+        \\    "hidden_size": 2048,
+        \\    "head_dim": 256,
+        \\    "num_hidden_layers": 40,
+        \\    "num_attention_heads": 16,
+        \\    "num_key_value_heads": 2,
+        \\    "num_experts": 256,
+        \\    "num_experts_per_tok": 8,
+        \\    "moe_intermediate_size": 512,
+        \\    "attn_output_gate": true,
+        \\    "tie_word_embeddings": false
+        \\  }
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqual(@as(u32, 0), config.quant_bits);
+    try testing.expectEqualStrings("qwen3_5_moe", config.model_type);
+    try testing.expectEqualStrings("language_model.model", config.weight_prefix);
+    try testing.expect(config.attn_output_gate);
+    try testing.expect(config.isMoe());
+    try testing.expectEqual(@as(u32, 256), config.num_experts);
+}
+
+test "parseConfigFromJson quantized qwen3_5_moe → quant_bits from key" {
+    // Same arch but with a "quantization" block: quant_bits must reflect it so
+    // the mandatory scale/bias fetches still fire (a missing scale is a clear
+    // MISSING WEIGHT error, not a silent dense fallback). Guards the default flip.
+    const json =
+        \\{
+        \\  "model_type": "qwen3_5_moe",
+        \\  "text_config": {"hidden_size": 2048, "num_experts": 256},
+        \\  "quantization": {"bits": 4, "group_size": 64}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqual(@as(u32, 4), config.quant_bits);
+    try testing.expectEqual(@as(u32, 64), config.quant_group_size);
 }

@@ -1437,11 +1437,17 @@ pub const Transformer = struct {
             getWeightFmt(weights, &name_buf, "{s}.embeddings.weight", prefix)
         else
             getWeightFmt(weights, &name_buf, "{s}.embed_tokens.weight", prefix);
-        const emb_s_arr = if (is_nemotron)
+        // Dense bf16 (quant_bits==0): no scales/biases exist → null-ctx arrays
+        // signal "plain bf16" to embedding()/dequantTake().
+        const emb_s_arr = if (config.quant_bits == 0)
+            mlx.mlx_array_new()
+        else if (is_nemotron)
             getWeightFmt(weights, &name_buf, "{s}.embeddings.scales", prefix)
         else
             getWeightFmt(weights, &name_buf, "{s}.embed_tokens.scales", prefix);
-        const emb_b_arr = if (is_nemotron)
+        const emb_b_arr = if (config.quant_bits == 0)
+            mlx.mlx_array_new()
+        else if (is_nemotron)
             getWeightFmt(weights, &name_buf, "{s}.embeddings.biases", prefix)
         else
             getWeightFmt(weights, &name_buf, "{s}.embed_tokens.biases", prefix);
@@ -1477,8 +1483,10 @@ pub const Transformer = struct {
             const maybe_lm_w = getWeightFmtOpt(weights, &name_buf, "{s}.lm_head.weight", lm_prefix);
             if (maybe_lm_w) |w| {
                 lm_head_w = w;
-                lm_head_s = getWeightFmt(weights, &name_buf, "{s}.lm_head.scales", lm_prefix);
-                lm_head_b = getWeightFmt(weights, &name_buf, "{s}.lm_head.biases", lm_prefix);
+                // Dense bf16: no scales/biases → null-ctx; lmHeadProject() then
+                // projects via a transposed view of the [vocab, hidden] weight.
+                lm_head_s = if (config.quant_bits == 0) mlx.mlx_array_new() else getWeightFmt(weights, &name_buf, "{s}.lm_head.scales", lm_prefix);
+                lm_head_b = if (config.quant_bits == 0) mlx.mlx_array_new() else getWeightFmt(weights, &name_buf, "{s}.lm_head.biases", lm_prefix);
                 owns_lm_head = !config.tie_word_embeddings;
             } else if (weights.get("lm_head.weight")) |w| {
                 lm_head_w = w;
@@ -1518,7 +1526,9 @@ pub const Transformer = struct {
             ssm_entries = ml.ssm_entries;
             moe_owned_bf16 = ml.owned_bf16;
         } else {
-            layers = try initStandardLayers(allocator, config, weights, &name_buf, s);
+            const sl = try initStandardLayers(allocator, config, weights, &name_buf, s);
+            layers = sl.layers;
+            moe_owned_bf16 = sl.owned_bf16; // reuse the same deinit-tracked owned list
         }
 
         const bits_cache: BitsCache = .{};
@@ -1540,8 +1550,9 @@ pub const Transformer = struct {
         var ple_proj_quantized = false;
         if (config.hidden_size_per_layer_input > 0) {
             ple_emb_w = getWeightFmt(weights, &name_buf, "{s}.embed_tokens_per_layer.weight", prefix);
-            ple_emb_s = getWeightFmt(weights, &name_buf, "{s}.embed_tokens_per_layer.scales", prefix);
-            ple_emb_b = getWeightFmt(weights, &name_buf, "{s}.embed_tokens_per_layer.biases", prefix);
+            // Dense bf16: no scales/biases → null-ctx; dequantTake takes its dense path.
+            ple_emb_s = if (config.quant_bits == 0) mlx.mlx_array_new() else getWeightFmt(weights, &name_buf, "{s}.embed_tokens_per_layer.scales", prefix);
+            ple_emb_b = if (config.quant_bits == 0) mlx.mlx_array_new() else getWeightFmt(weights, &name_buf, "{s}.embed_tokens_per_layer.biases", prefix);
             ple_proj_w_g = getWeightFmt(weights, &name_buf, "{s}.per_layer_model_projection.weight", prefix);
             // per_layer_model_projection may be unquantized (no scales/biases)
             if (getWeightFmtOpt(weights, &name_buf, "{s}.per_layer_model_projection.scales", prefix)) |sc| {
@@ -1640,11 +1651,13 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_vector_array_free(all_vec);
 
             _ = mlx.mlx_vector_array_append_value(all_vec, emb_w);
-            _ = mlx.mlx_vector_array_append_value(all_vec, emb_s_arr);
-            _ = mlx.mlx_vector_array_append_value(all_vec, emb_b_arr);
+            // Dense bf16 models have null-ctx embedding/lm_head scales/biases —
+            // appending a null array aborts in mlx (vector.cpp "non-empty" guard).
+            if (emb_s_arr.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, emb_s_arr);
+            if (emb_b_arr.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, emb_b_arr);
             _ = mlx.mlx_vector_array_append_value(all_vec, lm_head_w);
-            _ = mlx.mlx_vector_array_append_value(all_vec, lm_head_s);
-            _ = mlx.mlx_vector_array_append_value(all_vec, lm_head_b);
+            if (lm_head_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lm_head_s);
+            if (lm_head_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lm_head_b);
 
             if (moe_layers) |ml| {
                 for (ml) |lw| {
@@ -1676,34 +1689,44 @@ pub const Transformer = struct {
                     if (lw.post_ff_norm) |n| _ = mlx.mlx_vector_array_append_value(all_vec, n);
                     if (lw.q_norm) |n| _ = mlx.mlx_vector_array_append_value(all_vec, n);
                     if (lw.k_norm) |n| _ = mlx.mlx_vector_array_append_value(all_vec, n);
+                    // Dense bf16 layers carry null-ctx scales/biases — skip them so
+                    // the eval batch doesn't get a null array (mlx aborts on append).
                     _ = mlx.mlx_vector_array_append_value(all_vec, lw.q_w);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.q_s);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.q_b);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.k_w);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.k_s);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.k_b);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.v_w);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.v_s);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.v_b);
+                    if (lw.q_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.q_s);
+                    if (lw.q_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.q_b);
+                    if (lw.k_w.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.k_w);
+                    if (lw.k_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.k_s);
+                    if (lw.k_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.k_b);
+                    if (lw.v_w.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.v_w);
+                    if (lw.v_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.v_s);
+                    if (lw.v_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.v_b);
                     _ = mlx.mlx_vector_array_append_value(all_vec, lw.o_w);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.o_s);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.o_b);
+                    if (lw.o_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.o_s);
+                    if (lw.o_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.o_b);
                     _ = mlx.mlx_vector_array_append_value(all_vec, lw.gate_w);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.gate_s);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.gate_b);
+                    if (lw.gate_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.gate_s);
+                    if (lw.gate_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.gate_b);
                     _ = mlx.mlx_vector_array_append_value(all_vec, lw.up_w);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.up_s);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.up_b);
+                    if (lw.up_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.up_s);
+                    if (lw.up_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.up_b);
                     _ = mlx.mlx_vector_array_append_value(all_vec, lw.down_w);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.down_s);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.down_b);
+                    if (lw.down_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.down_s);
+                    if (lw.down_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.down_b);
                     if (lw.layer_scalar) |ls| _ = mlx.mlx_vector_array_append_value(all_vec, ls);
                     if (lw.ple_gate_w) |w| _ = mlx.mlx_vector_array_append_value(all_vec, w);
-                    if (lw.ple_gate_s) |sc| _ = mlx.mlx_vector_array_append_value(all_vec, sc);
-                    if (lw.ple_gate_b) |bi| _ = mlx.mlx_vector_array_append_value(all_vec, bi);
+                    if (lw.ple_gate_s) |sc| if (sc.ctx != null) {
+                        _ = mlx.mlx_vector_array_append_value(all_vec, sc);
+                    };
+                    if (lw.ple_gate_b) |bi| if (bi.ctx != null) {
+                        _ = mlx.mlx_vector_array_append_value(all_vec, bi);
+                    };
                     if (lw.ple_proj_w) |w| _ = mlx.mlx_vector_array_append_value(all_vec, w);
-                    if (lw.ple_proj_s) |sc| _ = mlx.mlx_vector_array_append_value(all_vec, sc);
-                    if (lw.ple_proj_b) |bi| _ = mlx.mlx_vector_array_append_value(all_vec, bi);
+                    if (lw.ple_proj_s) |sc| if (sc.ctx != null) {
+                        _ = mlx.mlx_vector_array_append_value(all_vec, sc);
+                    };
+                    if (lw.ple_proj_b) |bi| if (bi.ctx != null) {
+                        _ = mlx.mlx_vector_array_append_value(all_vec, bi);
+                    };
                     if (lw.ple_norm) |n| _ = mlx.mlx_vector_array_append_value(all_vec, n);
                 }
             }
@@ -2221,6 +2244,21 @@ pub const Transformer = struct {
         return qmatmulBits(x, w, sc, bi, qp.bits, qp.group_size, self.s);
     }
 
+    /// Final logits projection. For dense bf16 the lm_head weight is [vocab, hidden]
+    /// and is NOT pre-transposed at load (when tied it aliases emb_w, which must stay
+    /// [vocab, hidden] for the embedding lookup), so we project via a lazy transposed
+    /// view. Quantized models fall through to the standard gather/qmm path unchanged.
+    inline fn lmHeadProject(self: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array {
+        if (self.lm_head_s.ctx == null) {
+            const wt = try transposeBf16Weight(self.lm_head_w, self.s); // [hidden, vocab] view
+            defer _ = mlx.mlx_array_free(wt);
+            var result = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_matmul(&result, x, wt, self.s));
+            return result;
+        }
+        return self.qmatmul(x, self.lm_head_w, self.lm_head_s, self.lm_head_b);
+    }
+
     /// Resolve per-weight quant bits — convenience for callers that only need
     /// bits (e.g. embedding gather) and use `config.quant_group_size` directly.
     inline fn bitsFor(self: *const Transformer, w: mlx.mlx_array, sc: mlx.mlx_array, group_size: u32) u32 {
@@ -2293,28 +2331,33 @@ pub const Transformer = struct {
         var taken_w = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(taken_w);
         try mlx.check(mlx.mlx_take_axis(&taken_w, self.emb_w, flat_ids, 0, self.s));
-        var taken_s = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(taken_s);
-        try mlx.check(mlx.mlx_take_axis(&taken_s, self.emb_s, flat_ids, 0, self.s));
-        var taken_b = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(taken_b);
-        try mlx.check(mlx.mlx_take_axis(&taken_b, self.emb_b, flat_ids, 0, self.s));
 
         var emb = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(emb);
-        const emb_qp = self.quantParamsFor(self.emb_w, self.emb_s);
-        try mlx.check(mlx.mlx_dequantize(
-            &emb,
-            taken_w,
-            taken_s,
-            taken_b,
-            mlx.mlx_optional_int.some(@intCast(emb_qp.group_size)),
-            mlx.mlx_optional_int.some(@intCast(emb_qp.bits)),
-            "affine",
-            .{}, // global_scale (null)
-            .{ .value = .bfloat16, .has_value = true },
-            self.s,
-        ));
+        if (self.emb_s.ctx == null) {
+            // Dense bf16 embedding table: the gathered rows ARE the embeddings.
+            try mlx.check(mlx.mlx_astype(&emb, taken_w, .bfloat16, self.s));
+        } else {
+            var taken_s = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(taken_s);
+            try mlx.check(mlx.mlx_take_axis(&taken_s, self.emb_s, flat_ids, 0, self.s));
+            var taken_b = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(taken_b);
+            try mlx.check(mlx.mlx_take_axis(&taken_b, self.emb_b, flat_ids, 0, self.s));
+            const emb_qp = self.quantParamsFor(self.emb_w, self.emb_s);
+            try mlx.check(mlx.mlx_dequantize(
+                &emb,
+                taken_w,
+                taken_s,
+                taken_b,
+                mlx.mlx_optional_int.some(@intCast(emb_qp.group_size)),
+                mlx.mlx_optional_int.some(@intCast(emb_qp.bits)),
+                "affine",
+                .{}, // global_scale (null)
+                .{ .value = .bfloat16, .has_value = true },
+                self.s,
+            ));
+        }
 
         const out_shape = [_]c_int{ batch, seq_len, @intCast(self.config.hidden_size) };
         var reshaped = mlx.mlx_array_new();
@@ -2868,6 +2911,12 @@ pub const Transformer = struct {
         var tw = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(tw);
         try mlx.check(mlx.mlx_take_axis(&tw, w, ids, 0, self.s));
+        if (sc.ctx == null) {
+            // Dense bf16: gathered rows are the embeddings; no dequantize.
+            var result = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&result, tw, .bfloat16, self.s));
+            return result;
+        }
         var ts = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(ts);
         try mlx.check(mlx.mlx_take_axis(&ts, sc, ids, 0, self.s));
@@ -3495,7 +3544,7 @@ pub const Transformer = struct {
         }
 
         if (self.embedding_mode) return final_normed;
-        var logits = try self.qmatmul(final_normed, self.lm_head_w, self.lm_head_s, self.lm_head_b);
+        var logits = try self.lmHeadProject(final_normed);
         _ = mlx.mlx_array_free(final_normed);
 
         // Gemma 4: logit softcapping — tanh(logits / cap) * cap
@@ -3813,7 +3862,7 @@ pub const Transformer = struct {
         const final_normed = try self.rmsNorm(h, self.final_norm);
         _ = mlx.mlx_array_free(h);
 
-        var logits = try self.qmatmul(final_normed, self.lm_head_w, self.lm_head_s, self.lm_head_b);
+        var logits = try self.lmHeadProject(final_normed);
         _ = mlx.mlx_array_free(final_normed);
 
         if (self.softcap_scalar != null) {
@@ -4091,7 +4140,7 @@ pub const Transformer = struct {
         }
 
         if (self.embedding_mode) return final_normed;
-        var logits = try self.qmatmul(final_normed, self.lm_head_w, self.lm_head_s, self.lm_head_b);
+        var logits = try self.lmHeadProject(final_normed);
         _ = mlx.mlx_array_free(final_normed);
 
         // Gemma 4: logit softcapping — tanh(logits / cap) * cap
@@ -4166,12 +4215,12 @@ pub const Transformer = struct {
             const final_normed = try self.rmsNorm(h, self.final_norm);
             _ = mlx.mlx_array_free(h);
             if (self.embedding_mode) return final_normed;
-            const logits = try self.qmatmul(final_normed, self.lm_head_w, self.lm_head_s, self.lm_head_b);
+            const logits = try self.lmHeadProject(final_normed);
             _ = mlx.mlx_array_free(final_normed);
             return logits;
         } else {
             if (self.embedding_mode) return h;
-            const logits = try self.qmatmul(h, self.lm_head_w, self.lm_head_s, self.lm_head_b);
+            const logits = try self.lmHeadProject(h);
             _ = mlx.mlx_array_free(h);
             return logits;
         }
@@ -5448,14 +5497,14 @@ pub const Transformer = struct {
             // output [N,1,intermediate]. squeeze inner 1 → [N, intermediate].
             var gate_out_3d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gate_out_3d);
-            try mlx.check(mlx.mlx_gather_qmm(&gate_out_3d, x_rep, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, no_idx, sorted_inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(gate_bits)), "affine", true, self.s));
+            try gatherExpertMm(&gate_out_3d, x_rep, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, no_idx, sorted_inds, gate_bits, gs, true, self.s);
             var gate_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gate_out);
             try mlx.check(mlx.mlx_squeeze(&gate_out, gate_out_3d, self.s));
 
             var up_out_3d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(up_out_3d);
-            try mlx.check(mlx.mlx_gather_qmm(&up_out_3d, x_rep, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, no_idx, sorted_inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(up_bits)), "affine", true, self.s));
+            try gatherExpertMm(&up_out_3d, x_rep, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, no_idx, sorted_inds, up_bits, gs, true, self.s);
             var up_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(up_out);
             try mlx.check(mlx.mlx_squeeze(&up_out, up_out_3d, self.s));
@@ -5469,7 +5518,7 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_expand_dims(&act_exp, expert_act, -2, self.s));
             var down_3d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(down_3d);
-            try mlx.check(mlx.mlx_gather_qmm(&down_3d, act_exp, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, no_idx, sorted_inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(down_bits)), "affine", true, self.s));
+            try gatherExpertMm(&down_3d, act_exp, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, no_idx, sorted_inds, down_bits, gs, true, self.s);
             var down_squeezed = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(down_squeezed);
             try mlx.check(mlx.mlx_squeeze(&down_squeezed, down_3d, self.s)); // [N, hidden]
@@ -5490,14 +5539,14 @@ pub const Transformer = struct {
 
             var gate_out_5d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gate_out_5d);
-            try mlx.check(mlx.mlx_gather_qmm(&gate_out_5d, x_exp, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, no_idx, inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(gate_bits)), "affine", false, self.s));
+            try gatherExpertMm(&gate_out_5d, x_exp, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, no_idx, inds, gate_bits, gs, false, self.s);
             var gate_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gate_out);
             try mlx.check(mlx.mlx_squeeze(&gate_out, gate_out_5d, self.s));
 
             var up_out_5d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(up_out_5d);
-            try mlx.check(mlx.mlx_gather_qmm(&up_out_5d, x_exp, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, no_idx, inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(up_bits)), "affine", false, self.s));
+            try gatherExpertMm(&up_out_5d, x_exp, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, no_idx, inds, up_bits, gs, false, self.s);
             var up_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(up_out);
             try mlx.check(mlx.mlx_squeeze(&up_out, up_out_5d, self.s));
@@ -5510,7 +5559,7 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_expand_dims(&act_exp, expert_act, -2, self.s));
             var down_5d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(down_5d);
-            try mlx.check(mlx.mlx_gather_qmm(&down_5d, act_exp, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, no_idx, inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(down_bits)), "affine", false, self.s));
+            try gatherExpertMm(&down_5d, act_exp, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, no_idx, inds, down_bits, gs, false, self.s);
             try mlx.check(mlx.mlx_squeeze(&down_out, down_5d, self.s)); // [B, S, K, hidden]
         }
 
@@ -5647,14 +5696,28 @@ pub const Transformer = struct {
 
 // ── Init helpers ──
 
-fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights, name_buf: *[256]u8, s: mlx.mlx_stream) ![]LayerWeights {
+fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights, name_buf: *[256]u8, s: mlx.mlx_stream) !struct { layers: []LayerWeights, owned_bf16: []mlx.mlx_array } {
     log.info("Precomputing layer weights...\n", .{});
     const prefix = config.weight_prefix;
     const layers = try allocator.alloc(LayerWeights, config.num_hidden_layers);
+    // Dense bf16 weights are pre-transposed at load; track the new arrays so
+    // Transformer.deinit frees them. Empty (no allocations) for quantized models.
+    var owned_bf16: std.ArrayList(mlx.mlx_array) = .empty;
+    errdefer {
+        for (owned_bf16.items) |a| _ = mlx.mlx_array_free(a);
+        owned_bf16.deinit(allocator);
+    }
 
     for (0..config.num_hidden_layers) |i| {
         const li: u32 = @intCast(i);
         const lw = &layers[i];
+
+        // Gemma 4 KV-layer sharing: layers in the shared tail reuse an earlier
+        // layer's K/V (the forward reads `kv_source`'s cache), so they carry no
+        // k_proj/k_norm/v_proj of their own. Some exports physically drop those
+        // tensors — load them only for non-shared layers.
+        lw.kv_source = config.getKVSourceLayer(li);
+        const kv_shared = lw.kv_source != null;
 
         const input_norm_raw = getLayerWeight(weights, name_buf, prefix, li, "input_layernorm.weight");
         lw.input_norm = if (config.norm_has_offset) try addOne(input_norm_raw, s) else input_norm_raw;
@@ -5674,44 +5737,74 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
         if (config.has_qk_norm) {
             const q_norm_raw = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_norm.weight");
             lw.q_norm = if (config.norm_has_offset) try addOne(q_norm_raw, s) else q_norm_raw;
-            const k_norm_raw = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_norm.weight");
-            lw.k_norm = if (config.norm_has_offset) try addOne(k_norm_raw, s) else k_norm_raw;
+            // KV-shared layers compute no K, so they carry no k_norm.
+            if (kv_shared) {
+                lw.k_norm = null;
+            } else {
+                const k_norm_raw = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_norm.weight");
+                lw.k_norm = if (config.norm_has_offset) try addOne(k_norm_raw, s) else k_norm_raw;
+            }
         } else {
             lw.q_norm = null;
             lw.k_norm = null;
         }
 
         lw.q_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.weight");
-        lw.q_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.scales");
-        lw.q_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.biases");
-        lw.k_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.weight");
-        lw.k_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.scales");
-        lw.k_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.biases");
-        // Gemma 4 (31B): full_attention layers share V with K (no v_proj weight stored).
-        // Sliding_attention layers still have separate V.
-        lw.k_eq_v = config.attention_k_eq_v and config.isGlobalLayer(li);
-        if (lw.k_eq_v) {
-            lw.v_w = lw.k_w;
-            lw.v_s = lw.k_s;
-            lw.v_b = lw.k_b;
+        lw.q_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_proj.scales", config.quant_bits);
+        lw.q_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_proj.biases", config.quant_bits);
+        if (kv_shared) {
+            // No own K/V — the forward reads kv_source's cache. Leave empty.
+            lw.k_eq_v = false;
+            lw.k_w = mlx.mlx_array_new();
+            lw.k_s = mlx.mlx_array_new();
+            lw.k_b = mlx.mlx_array_new();
+            lw.v_w = mlx.mlx_array_new();
+            lw.v_s = mlx.mlx_array_new();
+            lw.v_b = mlx.mlx_array_new();
         } else {
-            lw.v_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.weight");
-            lw.v_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.scales");
-            lw.v_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.biases");
+            lw.k_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.weight");
+            lw.k_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.k_proj.scales", config.quant_bits);
+            lw.k_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.k_proj.biases", config.quant_bits);
+            // Gemma 4 (31B): full_attention layers share V with K (no v_proj weight stored).
+            // Sliding_attention layers still have separate V.
+            lw.k_eq_v = config.attention_k_eq_v and config.isGlobalLayer(li);
+            if (lw.k_eq_v) {
+                lw.v_w = lw.k_w;
+                lw.v_s = lw.k_s;
+                lw.v_b = lw.k_b;
+            } else {
+                lw.v_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.weight");
+                lw.v_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.v_proj.scales", config.quant_bits);
+                lw.v_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.v_proj.biases", config.quant_bits);
+            }
         }
         lw.o_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.weight");
-        lw.o_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.scales");
-        lw.o_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.biases");
+        lw.o_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.o_proj.scales", config.quant_bits);
+        lw.o_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.o_proj.biases", config.quant_bits);
 
         lw.gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.weight");
-        lw.gate_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.scales");
-        lw.gate_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.biases");
+        lw.gate_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mlp.gate_proj.scales", config.quant_bits);
+        lw.gate_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mlp.gate_proj.biases", config.quant_bits);
         lw.up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.weight");
-        lw.up_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.scales");
-        lw.up_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.biases");
+        lw.up_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mlp.up_proj.scales", config.quant_bits);
+        lw.up_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mlp.up_proj.biases", config.quant_bits);
         lw.down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.weight");
-        lw.down_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.scales");
-        lw.down_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.biases");
+        lw.down_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mlp.down_proj.scales", config.quant_bits);
+        lw.down_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mlp.down_proj.biases", config.quant_bits);
+
+        // Dense bf16: pre-transpose [out,in]→[in,out] so qmatmulBits dispatches to
+        // a plain matmul. No-ops on quantized weights (scales non-null).
+        try maybeTransposeForBf16(&lw.q_w, lw.q_s, &owned_bf16, allocator, s);
+        try maybeTransposeForBf16(&lw.k_w, lw.k_s, &owned_bf16, allocator, s);
+        if (lw.k_eq_v) {
+            lw.v_w = lw.k_w; // re-alias V to the transposed K (no second copy)
+        } else {
+            try maybeTransposeForBf16(&lw.v_w, lw.v_s, &owned_bf16, allocator, s);
+        }
+        try maybeTransposeForBf16(&lw.o_w, lw.o_s, &owned_bf16, allocator, s);
+        try maybeTransposeForBf16(&lw.gate_w, lw.gate_s, &owned_bf16, allocator, s);
+        try maybeTransposeForBf16(&lw.up_w, lw.up_s, &owned_bf16, allocator, s);
+        try maybeTransposeForBf16(&lw.down_w, lw.down_s, &owned_bf16, allocator, s);
 
         // Gemma 4: per-layer scalar
         lw.layer_scalar = getLayerWeightOpt(weights, name_buf, prefix, li, "layer_scalar");
@@ -5728,18 +5821,21 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
         lw.ple_norm = null;
         if (config.hidden_size_per_layer_input > 0) {
             lw.ple_gate_w = getLayerWeightOpt(weights, name_buf, prefix, li, "per_layer_input_gate.weight");
-            lw.ple_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "per_layer_input_gate.scales");
-            lw.ple_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "per_layer_input_gate.biases");
+            // Dense bf16: scales/biases don't exist. The forward unwraps these with
+            // `.?` then feeds qmatmul, so supply a null-ctx array (not Zig-null) →
+            // qmatmulBits sees the bf16 path.
+            lw.ple_gate_s = getLayerScaleOrEmptyOpt(weights, name_buf, prefix, li, "per_layer_input_gate.scales", config.quant_bits);
+            lw.ple_gate_b = getLayerScaleOrEmptyOpt(weights, name_buf, prefix, li, "per_layer_input_gate.biases", config.quant_bits);
             lw.ple_proj_w = getLayerWeightOpt(weights, name_buf, prefix, li, "per_layer_projection.weight");
-            lw.ple_proj_s = getLayerWeightOpt(weights, name_buf, prefix, li, "per_layer_projection.scales");
-            lw.ple_proj_b = getLayerWeightOpt(weights, name_buf, prefix, li, "per_layer_projection.biases");
+            lw.ple_proj_s = getLayerScaleOrEmptyOpt(weights, name_buf, prefix, li, "per_layer_projection.scales", config.quant_bits);
+            lw.ple_proj_b = getLayerScaleOrEmptyOpt(weights, name_buf, prefix, li, "per_layer_projection.biases", config.quant_bits);
             lw.ple_norm = getLayerWeightOpt(weights, name_buf, prefix, li, "post_per_layer_input_norm.weight");
+            // bf16: pre-transpose the two PLE projections (used via qmatmul).
+            if (lw.ple_gate_w) |*w| try maybeTransposeForBf16(w, lw.ple_gate_s.?, &owned_bf16, allocator, s);
+            if (lw.ple_proj_w) |*w| try maybeTransposeForBf16(w, lw.ple_proj_s.?, &owned_bf16, allocator, s);
         }
-
-        // Gemma 4: KV sharing source layer
-        lw.kv_source = config.getKVSourceLayer(li);
     }
-    return layers;
+    return .{ .layers = layers, .owned_bf16 = try owned_bf16.toOwnedSlice(allocator) };
 }
 
 /// Pre-transpose a plain-BF16 weight stored as `[out, in]` to `[in, out]` so
@@ -5747,9 +5843,15 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
 /// Unsloth Dynamic checkpoints that leave linear-attention projections
 /// unquantized while quantizing the rest. Caller owns the returned array.
 fn transposeBf16Weight(w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    // Swap the last two axes for any rank: 2D weights [out, in] → [in, out];
+    // stacked MoE expert tensors [experts, out, in] → [experts, in, out].
+    const ndim = mlx.getShape(w).len;
+    var perm: [8]c_int = undefined; // mlx arrays never exceed 8 dims here
+    for (0..ndim) |i| perm[i] = @intCast(i);
+    perm[ndim - 2] = @intCast(ndim - 1);
+    perm[ndim - 1] = @intCast(ndim - 2);
     var w_t = mlx.mlx_array_new();
-    const perm = [_]c_int{ 1, 0 };
-    try mlx.check(mlx.mlx_transpose_axes(&w_t, w, &perm, 2, s));
+    try mlx.check(mlx.mlx_transpose_axes(&w_t, w, &perm, @intCast(ndim), s));
     return w_t;
 }
 
@@ -5763,7 +5865,8 @@ fn maybeTransposeForBf16(
     allocator: std.mem.Allocator,
     s: mlx.mlx_stream,
 ) !void {
-    if (sc.ctx != null) return;
+    if (sc.ctx != null) return; // quantized weight — leave as-is
+    if (w.ctx == null) return; // absent weight (e.g. KV-shared layer) — nothing to transpose
     const transposed = try transposeBf16Weight(w.*, s);
     w.* = transposed;
     try owned.append(allocator, transposed);
@@ -5893,16 +5996,17 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             }
         } else {
             const k_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.weight");
-            const k_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.scales");
-            const k_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.biases");
+            const k_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.k_proj.scales", config.quant_bits);
+            const k_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.k_proj.biases", config.quant_bits);
             // Gemma 4 MoE: global layers use K=V (no separate v_proj)
             const v_w = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.weight") orelse k_w;
             const v_s = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.scales") orelse k_s;
             const v_b = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.biases") orelse k_b;
+            const v_aliases_k = v_w.ctx == k_w.ctx;
             lw.attn = .{ .full = .{
                 .q_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.weight"),
-                .q_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.scales"),
-                .q_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.biases"),
+                .q_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_proj.scales", config.quant_bits),
+                .q_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_proj.biases", config.quant_bits),
                 .k_w = k_w,
                 .k_s = k_s,
                 .k_b = k_b,
@@ -5910,11 +6014,26 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                 .v_s = v_s,
                 .v_b = v_b,
                 .o_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.weight"),
-                .o_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.scales"),
-                .o_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.biases"),
+                .o_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.o_proj.scales", config.quant_bits),
+                .o_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.o_proj.biases", config.quant_bits),
                 .q_norm = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_norm.weight"),
                 .k_norm = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_norm.weight"),
             } };
+            {
+                // Dense bf16 (null-ctx scales): pre-transpose [out,in]→[in,out] so
+                // qmatmulBits dispatches to a plain matmul. No-op on quantized weights.
+                const fa = &lw.attn.full;
+                try maybeTransposeForBf16(&fa.q_w, fa.q_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&fa.k_w, fa.k_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&fa.o_w, fa.o_s, &owned_bf16, allocator, s);
+                if (v_aliases_k) {
+                    // K=V share one weight — re-alias V to the transposed K (don't
+                    // create a second copy or double-free).
+                    fa.v_w = fa.k_w;
+                } else {
+                    try maybeTransposeForBf16(&fa.v_w, fa.v_s, &owned_bf16, allocator, s);
+                }
+            }
         }
 
         if (config.isMoe() and is_gemma4) {
@@ -6193,7 +6312,10 @@ fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: 
 
 fn appendFullAttnWeights(vec: mlx.mlx_vector_array, fa: *const FullAttnWeights) void {
     inline for (std.meta.fields(FullAttnWeights)) |field| {
-        _ = mlx.mlx_vector_array_append_value(vec, @field(fa, field.name));
+        // Dense bf16 full-attn layers carry null-ctx scales/biases — skip those
+        // so null arrays don't poison the eval batch. Mirrors the linear/mlp paths.
+        const arr = @field(fa, field.name);
+        if (arr.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, arr);
     }
 }
 
@@ -6298,6 +6420,29 @@ fn moeRoutingChain(router_logits: mlx.mlx_array, k: c_int, s: mlx.mlx_stream) !T
     try mlx.check(mlx.mlx_divide(&norm_scores, top_weights, weight_sum, s));
 
     return .{ .inds = inds, .norm_scores = norm_scores };
+}
+
+/// Gathered matmul for MoE expert dispatch — handles both quantized and dense bf16.
+/// Quantized (sc.ctx != null): mlx_gather_qmm with transpose_w=true, w stored [E,out,in].
+/// Dense bf16 (sc.ctx == null): mlx_gather_mm; w was pre-transposed to [E,in,out] at load
+/// (maybeTransposeForBf16 + generalized transposeBf16Weight), so x @ w is correct with no
+/// transpose flag — mirrors mlx-lm's `gather_mm(x, weight.swapaxes(-1,-2))`.
+fn gatherExpertMm(res: *mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, lhs_idx: mlx.mlx_array, rhs_idx: mlx.mlx_array, bits: u32, group_size: u32, sorted: bool, s: mlx.mlx_stream) !void {
+    if (sc.ctx == null) {
+        // mlx 0.31.2's `mlx_gather_mm` returns WRONG results with sorted_indices=true
+        // for the dense (non-quantized) path — the quantized `mlx_gather_qmm` honors
+        // the flag correctly, but the dense kernel does not. The sorted-indices flag is
+        // only a performance hint (rhs_indices ARE sorted here), so forcing false is
+        // always numerically correct; it just forgoes the sorted-stream optimization.
+        // Without this, dense bf16 MoE prefill (the sorted path, S>1) produced fluent
+        // but semantically-wrong output (e.g. Qwen3.6-35B-A3B-bf16 calling clean prompts
+        // "jumbled"). Verified byte-identical to mlx-lm once forced false. `sorted` is
+        // still honored by the quantized branch below, where gather_qmm handles it
+        // correctly.
+        try mlx.check(mlx.mlx_gather_mm(res, x, w, lhs_idx, rhs_idx, false, s));
+    } else {
+        try mlx.check(mlx.mlx_gather_qmm(res, x, w, sc, bi, lhs_idx, rhs_idx, true, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", sorted, s));
+    }
 }
 
 fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -6411,6 +6556,25 @@ fn getLayerWeight(weights: *const Weights, buf: *[256]u8, prefix: []const u8, la
         log.err("MISSING WEIGHT: {s}\n", .{name});
         unreachable;
     };
+}
+
+/// Fetch a quantization scale/bias tensor, tolerant of dense bf16 models.
+/// quant_bits == 0 ⇒ dense bf16 (no .scales/.biases exist anywhere) ⇒ return a
+/// null-ctx array, which downstream code (qmatmulBits, gatherExpertMm, append
+/// guards) reads as "this weight is plain bf16". quant_bits > 0 ⇒ a genuinely
+/// quantized model, so fetch mandatorily — a missing scale stays a clear
+/// MISSING WEIGHT error rather than silently degrading to a dense path.
+fn getLayerScaleOrEmpty(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, suffix: []const u8, quant_bits: u32) mlx.mlx_array {
+    if (quant_bits == 0) return mlx.mlx_array_new();
+    return getLayerWeight(weights, buf, prefix, layer, suffix);
+}
+
+/// Optional-typed variant for fields stored as `?mlx_array` (e.g. PLE projections).
+/// Dense bf16 ⇒ `some(null-ctx)` so call sites that unwrap with `.?` still get a
+/// valid (empty) array that qmatmul reads as bf16. Quantized ⇒ optional fetch.
+fn getLayerScaleOrEmptyOpt(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, suffix: []const u8, quant_bits: u32) ?mlx.mlx_array {
+    if (quant_bits == 0) return mlx.mlx_array_new();
+    return getLayerWeightOpt(weights, buf, prefix, layer, suffix);
 }
 
 fn bf16Scalar(val: f32, s: mlx.mlx_stream) mlx.mlx_array {
@@ -7035,6 +7199,217 @@ test "qmatmulBits dispatches to plain matmul when scales has null ctx (Unsloth D
     // (w transposed from [[0,1,2,3],[4,5,6,7]] gives w_t = [[0,4],[1,5],[2,6],[3,7]])
     try testing.expectApproxEqAbs(@as(f32, 14.0), data[0], 1e-3);
     try testing.expectApproxEqAbs(@as(f32, 38.0), data[1], 1e-3);
+}
+
+/// Test helper: eval `arr`, flatten, and copy the first `out.len` f32 values to host.
+fn testReadF32(arr: mlx.mlx_array, out: []f32, s: mlx.mlx_stream) !void {
+    var f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f);
+    try mlx.check(mlx.mlx_astype(&f, arr, .float32, s));
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    const sh = [_]c_int{@intCast(out.len)};
+    try mlx.check(mlx.mlx_reshape(&flat, f, &sh, 1, s));
+    const ev = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ev);
+    _ = mlx.mlx_vector_array_append_value(ev, flat);
+    try mlx.check(mlx.mlx_eval(ev));
+    const data = mlx.mlx_array_data_float32(flat) orelse return error.TestUnexpectedNullData;
+    @memcpy(out, data[0..out.len]);
+}
+
+test "gatherExpertMm dense bf16 matches per-expert ground truth (decode + prefill shapes)" {
+    // Centerpiece TDD gate for fully-dense bf16 MoE. Proves the dense gather_mm
+    // path (gatherExpertMm with null scales + generalized transposeBf16Weight)
+    // computes the same per-expert matmul as (a) an independent fp32 ground truth
+    // and (b) the established quantized gather_qmm path — for BOTH the decode
+    // (S=1, unsorted, 5D x) and prefill ([N,1,in], sorted) call shapes used by
+    // moeMLP2. If the historical Qwen3.6-A3B-bf16 generation bug lived in the
+    // expert gather, this test fails for the right reason.
+    const s = mlx.gpuStream();
+    const alloc = testing.allocator;
+
+    const E = 4;
+    const IN = 32; // must be a multiple of gs
+    const OUT = 8;
+    const gs = 32; // mlx_quantize supports group sizes 32, 64, 128
+    const bits = 8; // near-lossless quant for a tight cross-check
+
+    // Build w_orig [E, OUT, IN] bf16 from a deterministic small-valued buffer.
+    var w_host: [E * OUT * IN]f32 = undefined;
+    for (&w_host, 0..) |*v, i| v.* = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 13)) - 6))) * 0.05;
+    var w_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w_f32);
+    {
+        const sh = [_]c_int{ E, OUT, IN };
+        w_f32 = mlx.mlx_array_new_data(&w_host, &sh, 3, .float32);
+    }
+    var w_bf16 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w_bf16);
+    try mlx.check(mlx.mlx_astype(&w_bf16, w_f32, .bfloat16, s));
+
+    // Quantize → [q, sc, bi]; dequantize back so the dense path consumes the
+    // exact numbers gather_qmm sees internally (cancels quant error in the
+    // dense-vs-quant comparison).
+    var qvec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(qvec);
+    try mlx.check(mlx.mlx_quantize(&qvec, w_bf16, mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(bits), "affine", .{}, s));
+    var q_w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q_w);
+    var q_sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q_sc);
+    var q_bi = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q_bi);
+    try mlx.check(mlx.mlx_vector_array_get(&q_w, qvec, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&q_sc, qvec, 1));
+    try mlx.check(mlx.mlx_vector_array_get(&q_bi, qvec, 2));
+
+    var w_deq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w_deq);
+    try mlx.check(mlx.mlx_dequantize(&w_deq, q_w, q_sc, q_bi, mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(bits), "affine", .{}, .{ .value = .bfloat16, .has_value = true }, s));
+    // w_deq_t [E, IN, OUT] — the dense weight layout the loader produces.
+    const w_deq_t = try transposeBf16Weight(w_deq, s);
+    defer _ = mlx.mlx_array_free(w_deq_t);
+
+    // Read dequantized weights to host for ground truth: w_deq_host[e*OUT*IN + o*IN + k].
+    var w_deq_host: [E * OUT * IN]f32 = undefined;
+    try testReadF32(w_deq, &w_deq_host, s);
+
+    const null_sc = mlx.mlx_array{ .ctx = null };
+    const null_bi = mlx.mlx_array{ .ctx = null };
+    const no_idx = mlx.mlx_array{ .ctx = null };
+
+    // ── Decode shape: x_exp [1,1,1,1,IN], inds [1,1,K], sorted=false ──
+    {
+        const K = 2;
+        var x_host: [IN]f32 = undefined;
+        for (&x_host, 0..) |*v, i| v.* = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 5)) - 2))) * 0.1;
+        var x_f32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x_f32);
+        {
+            const sh = [_]c_int{IN};
+            x_f32 = mlx.mlx_array_new_data(&x_host, &sh, 1, .float32);
+        }
+        var x_bf = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x_bf);
+        try mlx.check(mlx.mlx_astype(&x_bf, x_f32, .bfloat16, s));
+        var x_exp = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x_exp);
+        {
+            const sh = [_]c_int{ 1, 1, 1, 1, IN };
+            try mlx.check(mlx.mlx_reshape(&x_exp, x_bf, &sh, 5, s));
+        }
+        var x_bf_host: [IN]f32 = undefined;
+        try testReadF32(x_bf, &x_bf_host, s);
+
+        const inds_host = [_]u32{ 1, 3 };
+        var inds = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(inds);
+        {
+            const sh = [_]c_int{ 1, 1, K };
+            inds = mlx.mlx_array_new_data(&inds_host, &sh, 3, .uint32);
+        }
+
+        // Ground truth: gt[k*OUT + o] = sum_in x[in] * w_deq[inds[k]][o][in].
+        var gt: [K * OUT]f32 = undefined;
+        for (0..K) |k| {
+            const e = inds_host[k];
+            for (0..OUT) |o| {
+                var acc: f32 = 0;
+                for (0..IN) |in| acc += x_bf_host[in] * w_deq_host[e * OUT * IN + o * IN + in];
+                gt[k * OUT + o] = acc;
+            }
+        }
+
+        // Dense path.
+        var dense5 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(dense5);
+        try gatherExpertMm(&dense5, x_exp, w_deq_t, null_sc, null_bi, no_idx, inds, bits, gs, false, s);
+        var dense = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(dense);
+        try mlx.check(mlx.mlx_squeeze(&dense, dense5, s)); // [K, OUT]
+        const dense_host = try alloc.alloc(f32, K * OUT);
+        defer alloc.free(dense_host);
+        try testReadF32(dense, dense_host, s);
+
+        // Quantized path (cross-check).
+        var quant5 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(quant5);
+        try gatherExpertMm(&quant5, x_exp, q_w, q_sc, q_bi, no_idx, inds, bits, gs, false, s);
+        var quant = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(quant);
+        try mlx.check(mlx.mlx_squeeze(&quant, quant5, s));
+        const quant_host = try alloc.alloc(f32, K * OUT);
+        defer alloc.free(quant_host);
+        try testReadF32(quant, quant_host, s);
+
+        for (0..K * OUT) |i| {
+            try testing.expectApproxEqAbs(gt[i], dense_host[i], 2e-2); // dense == ground truth
+            try testing.expectApproxEqAbs(gt[i], quant_host[i], 2e-2); // quant agrees too
+        }
+    }
+
+    // ── Prefill/sorted shape: x_rep [N,1,IN], sorted_inds [N], sorted=true ──
+    {
+        const N = 5;
+        var x_host: [N * IN]f32 = undefined;
+        for (&x_host, 0..) |*v, i| v.* = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3))) * 0.07;
+        var x_f32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x_f32);
+        {
+            const sh = [_]c_int{ N, 1, IN };
+            x_f32 = mlx.mlx_array_new_data(&x_host, &sh, 3, .float32);
+        }
+        var x_rep = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x_rep);
+        try mlx.check(mlx.mlx_astype(&x_rep, x_f32, .bfloat16, s));
+        var x_bf_host: [N * IN]f32 = undefined;
+        try testReadF32(x_rep, &x_bf_host, s);
+
+        const sorted_host = [_]u32{ 0, 0, 1, 2, 3 }; // sorted experts
+        var sorted_inds = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sorted_inds);
+        {
+            const sh = [_]c_int{N};
+            sorted_inds = mlx.mlx_array_new_data(&sorted_host, &sh, 1, .uint32);
+        }
+
+        // Ground truth: gt[i*OUT + o] = sum_in x[i][in] * w_deq[sorted[i]][o][in].
+        var gt: [N * OUT]f32 = undefined;
+        for (0..N) |i| {
+            const e = sorted_host[i];
+            for (0..OUT) |o| {
+                var acc: f32 = 0;
+                for (0..IN) |in| acc += x_bf_host[i * IN + in] * w_deq_host[e * OUT * IN + o * IN + in];
+                gt[i * OUT + o] = acc;
+            }
+        }
+
+        var dense3 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(dense3);
+        try gatherExpertMm(&dense3, x_rep, w_deq_t, null_sc, null_bi, no_idx, sorted_inds, bits, gs, true, s);
+        var dense = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(dense);
+        try mlx.check(mlx.mlx_squeeze(&dense, dense3, s)); // [N, OUT]
+        const dense_host = try alloc.alloc(f32, N * OUT);
+        defer alloc.free(dense_host);
+        try testReadF32(dense, dense_host, s);
+
+        var quant3 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(quant3);
+        try gatherExpertMm(&quant3, x_rep, q_w, q_sc, q_bi, no_idx, sorted_inds, bits, gs, true, s);
+        var quant = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(quant);
+        try mlx.check(mlx.mlx_squeeze(&quant, quant3, s));
+        const quant_host = try alloc.alloc(f32, N * OUT);
+        defer alloc.free(quant_host);
+        try testReadF32(quant, quant_host, s);
+
+        for (0..N * OUT) |i| {
+            try testing.expectApproxEqAbs(gt[i], dense_host[i], 2e-2);
+            try testing.expectApproxEqAbs(gt[i], quant_host[i], 2e-2);
+        }
+    }
 }
 
 test "appendLinearAttnWeights skips fields with null ctx (plain bf16 layers)" {

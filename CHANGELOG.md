@@ -1,6 +1,6 @@
 # Changelog
 
-## v26.6.5 — Voice Mode reliability, agents that finish
+## v26.6.5 — Voice Mode reliability, agents that finish, dense bf16 Gemma
 
 - **Voice Mode can hear you again.** A code-signing fix grants the app the microphone entitlement it needs under macOS's hardened runtime, so the permission prompt actually appears the first time you say "Hey Loki" — previously mic access was silently denied and Voice Mode never picked up a word. Applied to both local and released/notarized builds.
 
@@ -13,6 +13,10 @@
 - **Gemma 4 12B won't spin forever after a big tool result.** The 12B model occasionally collapsed into repeating its thinking opener endlessly until it burned the entire token budget; the server now detects a stuck repetition loop mid-generation and ends the turn cleanly. A companion fix keeps a raw control tag from leaking into a reply that was cut off mid-thought.
 
 - **Longer answers get cut off far less often.** The default max-tokens rises from 4,096 to 16,384, so a reasoning trace plus a real code or agent answer no longer trips the truncation cap in the middle of a reply (the server still clamps to your context window, so it can't overflow). When output is genuinely truncated, the "output truncated" notice now appears exactly once per turn instead of stacking on every step.
+
+- **Full-precision bf16 Gemma 4, no repack required.** Checkpoints that ship in plain bf16 with no quantization key now load and generate — including Google's quantization-aware-trained `gemma-4-E2B-it-qat-bf16` and dense bf16 Qwen 3.5/3.6. Gemma's E-series layout is handled natively, including its memory-saving attention blocks that share key/value tensors across layers, so you get full-fidelity output without converting the model to a quantized format first.
+
+- **bf16 Gemma 4 sees images too.** The QAT bf16 Gemma 4 vision tower now works out of the box — no need to launch with vision disabled. Attach a photo and the model recognizes colors, shapes, and objects, exactly like the quantized Gemma 4 vision models.
 
 ---
 

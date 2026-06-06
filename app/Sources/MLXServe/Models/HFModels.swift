@@ -101,6 +101,25 @@ struct HFModel: Identifiable, Codable {
         (tags ?? []).contains { $0.lowercased() == "gguf" }
     }
 
+    /// The non-affine FP quantization this repo uses, if any — e.g. "NVFP4",
+    /// "MXFP8". MXFP (OCP microscaling) and NVFP (NVIDIA FP4) store weights in a
+    /// layout the MLX safetensors loader can't decode; the Zig server's
+    /// discovery gate already skips them (`model_discovery.peekConfig`:
+    /// `quantization.mode != "affine"`), so flag them here too rather than
+    /// offering a download that silently never loads. Name-based, matching the
+    /// `quantization` idiom. GGUF repos are exempt: llama.cpp loads mxfp4
+    /// (GPT-OSS) natively, and the server's quant gate is MLX/safetensors-only.
+    var unsupportedQuantization: String? {
+        if isGgufRepo { return nil }
+        let lower = id.lowercased()
+        for token in Self.unsupportedQuantizationTokens where lower.contains(token) {
+            return token.uppercased()
+        }
+        return nil
+    }
+
+    private static let unsupportedQuantizationTokens: [String] = ["nvfp4", "mxfp4", "mxfp6", "mxfp8"]
+
     /// Human-readable reason why this model isn't compatible.
     var incompatibleReason: String? {
         if !isCompatible, let tag = pipelineTag {
@@ -108,6 +127,9 @@ struct HFModel: Identifiable, Codable {
         }
         if !isSupportedArchitecture {
             return "Unsupported architecture"
+        }
+        if let quant = unsupportedQuantization {
+            return "Unsupported quantization (\(quant))"
         }
         return nil
     }
@@ -148,15 +170,40 @@ struct HFModel: Identifiable, Codable {
         id.split(separator: "/").last.map(String.init) ?? id
     }
 
+    /// Human label for the badge column, parsed from the repo id. Generalized
+    /// over bit width (any N — 2/3/4/5/6/8/9/…, incl. fractional like "3.5bit")
+    /// rather than a hardcoded set, covering both MLX "Nbit"/"N-bit" and GGUF
+    /// "qN_"/"iqN_" naming, plus the FP weight dtypes. Returns nil when the id
+    /// encodes no single quant (e.g. a multi-quant GGUF repo, where the user
+    /// picks the quant at download time). Non-affine FP formats (nvfp4/mxfp*)
+    /// deliberately don't match here — they surface via `incompatibleReason`,
+    /// not as a misleading bit badge.
     var quantization: String? {
+        // GGUF repos host multiple quants in separate files; the repo ID alone
+        // doesn't identify one, so surface "Multi" rather than "—".
+        if isGgufRepo { return Self.quantizationLabel(forId: id) ?? "Multi" }
+        return Self.quantizationLabel(forId: id)
+    }
+
+    static func quantizationLabel(forId id: String) -> String? {
         let lower = id.lowercased()
-        if lower.contains("4bit") || lower.contains("4-bit") || lower.contains("q4_") { return "4-bit" }
-        if lower.contains("3bit") || lower.contains("3-bit") { return "3-bit" }
-        if lower.contains("6bit") || lower.contains("6-bit") { return "6-bit" }
-        if lower.contains("8bit") || lower.contains("8-bit") || lower.contains("q8_") { return "8-bit" }
         if lower.contains("fp16") { return "FP16" }
         if lower.contains("bf16") { return "BF16" }
+        if let s = firstCapture(lower, quantBitRegex) { return "\(s)-bit" }
+        if let s = firstCapture(lower, ggufQuantRegex) { return "\(s)-bit" }
         return nil
+    }
+
+    /// MLX-style width: digits (optionally fractional) immediately before an
+    /// optional hyphen and "bit" — "4bit", "8-bit", "3.5bit".
+    private static let quantBitRegex = try! NSRegularExpression(pattern: #"(\d+(?:\.\d+)?)-?bit"#)
+    /// GGUF-style width: "qN_" / "iqN_" (e.g. "Q4_K_M", "IQ3_M").
+    private static let ggufQuantRegex = try! NSRegularExpression(pattern: #"i?q(\d+)_"#)
+
+    private static func firstCapture(_ s: String, _ re: NSRegularExpression) -> String? {
+        guard let m = re.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)),
+              let r = Range(m.range(at: 1), in: s) else { return nil }
+        return String(s[r])
     }
 
     /// Estimated on-disk / in-memory size in bytes.

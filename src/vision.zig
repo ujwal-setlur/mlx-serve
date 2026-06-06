@@ -182,8 +182,10 @@ pub const VisionEncoder = struct {
             try eval_list.append(allocator, patch_w);
             try eval_list.append(allocator, pos_emb);
             try eval_list.append(allocator, proj_w);
-            if (mlx.mlx_array_ndim(proj_s) > 0) try eval_list.append(allocator, proj_s);
-            if (mlx.mlx_array_ndim(proj_b) > 0) try eval_list.append(allocator, proj_b);
+            // Dense bf16 projector has null-ctx scales/biases; mlx_array_ndim
+            // throws on a null handle (it does not return 0), so gate on .ctx.
+            if (proj_s.ctx != null) try eval_list.append(allocator, proj_s);
+            if (proj_b.ctx != null) try eval_list.append(allocator, proj_b);
             if (std_scale_opt) |a| try eval_list.append(allocator, a);
             if (std_bias_opt) |a| try eval_list.append(allocator, a);
             for (layers) |lw| {
@@ -325,7 +327,10 @@ pub const VisionEncoder = struct {
     /// non-empty (ndim>0) selects the quantized path; otherwise a plain matmul.
     fn quantLinear(self: *VisionEncoder, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, qb: mlx.mlx_array, bits: u32, bias: ?mlx.mlx_array) !mlx.mlx_array {
         var out = mlx.mlx_array_new();
-        if (mlx.mlx_array_ndim(sc) > 0) {
+        // Quantized weight has scales (non-null ctx); dense bf16 weight ships a
+        // null-ctx `mlx_array_new()` placeholder. Gate on .ctx, not ndim, because
+        // mlx_array_ndim throws on a null handle.
+        if (sc.ctx != null) {
             try mlx.check(mlx.mlx_quantized_matmul(
                 &out, x, w, sc, qb, true,
                 mlx.mlx_optional_int.some(@intCast(self.proj_quant_group_size)),
@@ -649,7 +654,8 @@ pub const VisionEncoder = struct {
         _ = mlx.mlx_array_free(post_std);
 
         var post_normed: mlx.mlx_array = undefined;
-        if (mlx.mlx_array_ndim(self.proj_s) > 0) {
+        // .ctx (not ndim) — dense bf16 projector's proj_s is a null-ctx handle.
+        if (self.proj_s.ctx != null) {
             post_normed = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_quantized_matmul(
                 &post_normed, pre_proj_normed, self.proj_w, self.proj_s, self.proj_b,
@@ -1442,7 +1448,10 @@ fn bf16Scalar(val: f32, s: mlx.mlx_stream) mlx.mlx_array {
 }
 
 fn detectProjBits(w: mlx.mlx_array, sc: mlx.mlx_array, group_size: u32) u32 {
-    if (mlx.mlx_array_ndim(sc) < 2) return 4;
+    // A dense bf16 projector has null-ctx scales; mlx_array_ndim throws on a
+    // null handle, so short-circuit first. The returned bits are unused in that
+    // case (quantLinear takes the dense matmul path), so any value is fine.
+    if (sc.ctx == null or mlx.mlx_array_ndim(sc) < 2) return 4;
     const w_shape = mlx.getShape(w);
     const s_shape = mlx.getShape(sc);
     if (w_shape.len < 2 or s_shape.len < 2) return 4;
@@ -1507,4 +1516,60 @@ test "unified patchify produces [1, gh*gw, 3*P*P] model patches" {
     try testing.expectEqual(@as(c_int, 1), shape[0]);
     try testing.expectEqual(@as(c_int, 2), shape[1]); // gh*gw
     try testing.expectEqual(@as(c_int, 3 * 48 * 48), shape[2]); // 6912
+}
+
+test "detectProjBits returns dense default for null-ctx scales" {
+    // A fully-dense bf16 multimodal projector (e.g. gemma-4-E2B-it-qat-bf16)
+    // ships `embed_vision.embedding_projection.weight` with NO `.scales`, so the
+    // scales handle is a null-ctx `mlx_array_new()`. mlx-c 0.6.0's
+    // `mlx_array_ndim` THROWS "expected a non-empty mlx_array" on a null-ctx
+    // array (it does not return 0), which used to abort `VisionEncoder.init`.
+    // detectProjBits must short-circuit on the null handle and return the dense
+    // default (4) — the value is unused because quantLinear takes its dense path.
+    const dense_scales = mlx.mlx_array_new(); // null-ctx
+    const w = mlx.mlx_array_new(); // weight irrelevant on the dense short-circuit
+    try testing.expectEqual(@as(u32, 4), detectProjBits(w, dense_scales, 64));
+}
+
+test "quantLinear dense fallback computes x @ Wᵀ for a bf16 projector" {
+    // The dense projector path (scales absent) must transpose the [out, in]
+    // weight and matmul — identical x @ Wᵀ semantics to the quantized
+    // transpose=true path. Guards both the null-ctx ndim short-circuit (line
+    // 328) and the matmul orientation. x[1,2] @ W[3,2]ᵀ = [1,3].
+    var enc: VisionEncoder = undefined;
+    enc.s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(enc.s);
+    enc.proj_quant_group_size = 64; // unused on the dense branch
+
+    var x_buf = [_]f32{ 1.0, 2.0 };
+    const x_shape = [_]c_int{ 1, 2 };
+    const x = mlx.mlx_array_new_data(&x_buf, &x_shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(x);
+
+    // W is [out=3, in=2]: rows [1,0],[0,1],[1,1].
+    var w_buf = [_]f32{ 1.0, 0.0, 0.0, 1.0, 1.0, 1.0 };
+    const w_shape = [_]c_int{ 3, 2 };
+    const w = mlx.mlx_array_new_data(&w_buf, &w_shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(w);
+
+    const out = try enc.quantLinear(x, w, mlx.mlx_array_new(), mlx.mlx_array_new(), 4, null);
+    defer _ = mlx.mlx_array_free(out);
+
+    const oshape = mlx.getShape(out);
+    try testing.expectEqual(@as(usize, 2), oshape.len);
+    try testing.expectEqual(@as(c_int, 1), oshape[0]);
+    try testing.expectEqual(@as(c_int, 3), oshape[1]);
+
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    const fshape = [_]c_int{3};
+    try mlx.check(mlx.mlx_reshape(&flat, out, &fshape, 1, enc.s));
+    const ev = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ev);
+    _ = mlx.mlx_vector_array_append_value(ev, flat);
+    try mlx.check(mlx.mlx_eval(ev));
+    const ptr = mlx.mlx_array_data_float32(flat) orelse return error.NullData;
+    try testing.expectApproxEqAbs(@as(f32, 1.0), ptr[0], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 2.0), ptr[1], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 3.0), ptr[2], 1e-4);
 }
